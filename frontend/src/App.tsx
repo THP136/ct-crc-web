@@ -4,6 +4,7 @@ import {
   fetchLivePrices,
   fetchSettings,
   saveSettings,
+  ensureSettings,
   fetchSummary,
   fetchSections,
   createSection,
@@ -36,6 +37,18 @@ function formatPrice(price: number): string {
   return price.toLocaleString(undefined, {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
+  });
+}
+
+const COIN_QTY_PATTERN = /^\d+(\.\d{1,8})?$/;
+const SYMBOL_PATTERN = /^[A-Z0-9]{2,20}$/;
+
+function formatQty(value: number | string): string {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return String(value);
+  return num.toLocaleString(undefined, {
+    maximumFractionDigits: 8,
+    useGrouping: false,
   });
 }
 
@@ -218,6 +231,8 @@ function App() {
     Record<string, SettingsEdit>
   >({});
   const [settingsMessage, setSettingsMessage] = useState("");
+  const [newSymbol, setNewSymbol] = useState("");
+  const [addingSymbol, setAddingSymbol] = useState(false);
 
   // Summary
   const [summaryData, setSummaryData] = useState<SummarySymbol[]>([]);
@@ -228,6 +243,24 @@ function App() {
     online: boolean;
     workers: WorkerStatus[];
   } | null>(null);
+
+  const applySettingsItems = (items: SettingsItem[]) => {
+    setSettingsList(items);
+    const edits: Record<string, SettingsEdit> = {};
+    for (const item of items) {
+      edits[item.symbol] = settingsToEdit(item);
+    }
+    setSettingsEdits(edits);
+  };
+
+  const settingsDirty = (symbol: string): boolean => {
+    const saved = settingsList.find((s) => s.symbol === symbol);
+    const edit = settingsEdits[symbol];
+    if (!saved || !edit) return false;
+    return SETTINGS_FIELDS.some(
+      (field) => Number(edit[field.key]) !== Number(saved[field.key])
+    );
+  };
 
   const loadAllSections = async () => {
     const secs = await fetchSections();
@@ -266,8 +299,15 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (page === "engine") loadAllSections();
-  }, [page]);
+    if (page !== "engine") return;
+    const poll = () => {
+      loadAllSections();
+      if (selectedSectionId) loadSectionInfo(selectedSectionId);
+    };
+    poll();
+    const id = setInterval(poll, 10_000);
+    return () => clearInterval(id);
+  }, [page, selectedSectionId]);
 
   useEffect(() => {
     if (selectedSectionId) {
@@ -305,14 +345,7 @@ function App() {
   // Settings
   useEffect(() => {
     if (page !== "settings") return;
-    fetchSettings().then((items) => {
-      setSettingsList(items);
-      const edits: Record<string, SettingsEdit> = {};
-      for (const s of items) {
-        edits[s.symbol] = settingsToEdit(s);
-      }
-      setSettingsEdits(edits);
-    });
+    fetchSettings().then(applySettingsItems);
   }, [page]);
 
   // Summary
@@ -347,15 +380,73 @@ function App() {
   );
 
   // Handlers
+  const handleAddSymbol = async () => {
+    const sym = newSymbol.trim().toUpperCase();
+    if (!SYMBOL_PATTERN.test(sym)) {
+      setSettingsMessage("Symbol phải 2-20 ký tự A-Z/0-9.");
+      return;
+    }
+    if (settingsList.some((s) => s.symbol === sym)) {
+      setSettingsMessage(`${sym} đã có settings. Không reset.`);
+      return;
+    }
+    setAddingSymbol(true);
+    setSettingsMessage(`Adding ${sym}…`);
+    try {
+      const res = await ensureSettings(sym);
+      if (res.error) {
+        setSettingsMessage(res.error);
+        return;
+      }
+      const items = await fetchSettings();
+      applySettingsItems(items);
+      setNewSymbol("");
+      setSettingsMessage(
+        `Added ${sym} with defaults. Review and Save before creating a section.`
+      );
+    } finally {
+      setAddingSymbol(false);
+    }
+  };
+
   const handleCreateSection = async () => {
     const sym = newSectionSymbol.trim().toUpperCase();
     const name = newSectionName.trim();
     const x0 = parseFloat(newSectionX0.replace(/,/g, "").trim());
+    const qtyText = newSectionQty.trim();
     if (!sym || !name || isNaN(x0) || x0 <= 0) return;
-    const qty = parseFloat(newSectionQty.replace(/,/g, "").trim()) || 0;
+    if (!COIN_QTY_PATTERN.test(qtyText)) {
+      setEngineMessage(
+        "coin_qty phải > 0, tối đa 8 chữ số thập phân (không dùng dấu phẩy)."
+      );
+      return;
+    }
+    if (!SYMBOL_PATTERN.test(sym)) {
+      setEngineMessage("Symbol phải 2-20 ký tự A-Z/0-9.");
+      return;
+    }
     setCreateError(null);
+
+    let currentSettings = settingsList;
+    if (!currentSettings.some((s) => s.symbol === sym)) {
+      currentSettings = await fetchSettings();
+      applySettingsItems(currentSettings);
+    }
+    if (!currentSettings.some((s) => s.symbol === sym)) {
+      setEngineMessage(
+        `Symbol ${sym} chưa có settings. Vào Settings → Add symbol và Save trước.`
+      );
+      return;
+    }
+    if (settingsDirty(sym)) {
+      setEngineMessage(
+        `Settings của ${sym} có thay đổi chưa Save. Vào Settings và Save trước.`
+      );
+      return;
+    }
+
     setEngineMessage(`Queued create_section for ${sym}…`);
-    const result = await createSection(sym, name, x0, qty);
+    const result = await createSection(sym, name, x0, qtyText);
     if (result.error) {
       if (result.nearest_prices && result.nearest_prices.length > 0) {
         setCreateError({
@@ -369,7 +460,7 @@ function App() {
     } else {
       setCreateError(null);
       setEngineMessage(
-        `Created section "${name}" for ${sym} with x0=${formatPrice(x0)}, qty=${qty}`
+        `Created section "${name}" for ${sym} with x0=${formatPrice(x0)}, qty=${formatQty(qtyText)}`
       );
       setNewSectionSymbol("");
       setNewSectionName("");
@@ -611,20 +702,25 @@ function App() {
                 </div>
                 <input
                   type="text"
-                  placeholder="Số lượng coin"
+                  placeholder="Số lượng coin (VD 0.12345678)"
                   value={newSectionQty}
                   onChange={(e) => setNewSectionQty(e.target.value)}
                   onKeyDown={(e) =>
                     e.key === "Enter" && handleCreateSection()
                   }
                 />
+                <p className="sub" style={{ flexBasis: "100%", margin: 0 }}>
+                  Tối đa 8 chữ số thập phân. Binance khớp theo lot size của từng
+                  symbol (ETHUSDT thường 4 chữ số).
+                </p>
                 <button
                   type="button"
                   onClick={handleCreateSection}
                   disabled={
                     !newSectionSymbol.trim() ||
                     !newSectionName.trim() ||
-                    !newSectionX0.trim()
+                    !newSectionX0.trim() ||
+                    !newSectionQty.trim()
                   }
                 >
                   Create
@@ -715,7 +811,7 @@ function App() {
                           {sec.current_pct >= 0 ? "+" : ""}
                           {sec.current_pct.toFixed(4)}%
                         </span>
-                        <span>qty: {sec.coin_qty}</span>
+                        <span>qty: {formatQty(sec.coin_qty)}</span>
                       </div>
                     </div>
                   ))}
@@ -811,7 +907,7 @@ function App() {
                     <div className="engine-stat">
                       <span className="engine-stat-label">Coin Qty</span>
                       <span className="engine-stat-value">
-                        {selectedSection.coin_qty}
+                        {formatQty(selectedSection.coin_qty)}
                       </span>
                     </div>
                     {livePrices[selectedSection.symbol] !== undefined && (
@@ -1086,9 +1182,26 @@ function App() {
               {settingsMessage && (
                 <div className="engine-message">{settingsMessage}</div>
               )}
+              <div className="engine-init-form">
+                <input
+                  type="text"
+                  placeholder="Symbol, e.g. ETH"
+                  value={newSymbol}
+                  onChange={(e) => setNewSymbol(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleAddSymbol()}
+                />
+                <button
+                  type="button"
+                  onClick={handleAddSymbol}
+                  disabled={addingSymbol || !newSymbol.trim()}
+                >
+                  {addingSymbol ? "Adding…" : "Add symbol"}
+                </button>
+              </div>
               {settingsList.length === 0 ? (
                 <p className="sub">
-                  Chưa có symbol nào. Tạo section trước để tạo settings.
+                  Chưa có settings. Thêm symbol để cấu hình trước, hoặc tạo
+                  section.
                 </p>
               ) : (
                 <div className="settings-cards">
@@ -1101,6 +1214,15 @@ function App() {
                           setSettingsMessage(error);
                           return;
                         }
+                      }
+                      if (
+                        Number(edit.sell_down_pct) + Number(edit.sell_up_pct) >
+                        100
+                      ) {
+                        setSettingsMessage(
+                          "SELL DOWN % + SELL UP % phải <= 100."
+                        );
+                        return;
                       }
                       const payload: SettingsPayload = {
                         sell_down_pct: Number(edit.sell_down_pct),
@@ -1129,12 +1251,7 @@ function App() {
                       }
                       setSettingsMessage(`Saved ${s.symbol}.`);
                       const items = await fetchSettings();
-                      setSettingsList(items);
-                      const edits: Record<string, SettingsEdit> = {};
-                      for (const item of items) {
-                        edits[item.symbol] = settingsToEdit(item);
-                      }
-                      setSettingsEdits(edits);
+                      applySettingsItems(items);
                       setToast(true);
                       setTimeout(() => setToast(false), 2000);
                     };
@@ -1255,7 +1372,7 @@ function App() {
                                 {r.target_pct.toFixed(4)}%
                               </td>
                               <td>{formatPrice(r.target_price)}</td>
-                              <td>{r.coins_to_trade.toFixed(4)}</td>
+                              <td>{formatQty(r.coins_to_trade)}</td>
                             </tr>
                           ))}
                           <tr className="summary-total-row">
@@ -1264,7 +1381,7 @@ function App() {
                             </td>
                             <td>
                               <strong>
-                                {sym.total_sell_down_coins.toFixed(4)}
+                                {formatQty(sym.total_sell_down_coins)}
                               </strong>
                             </td>
                           </tr>
@@ -1325,7 +1442,7 @@ function App() {
                                 {r.target_pct.toFixed(4)}%
                               </td>
                               <td>{formatPrice(r.target_price)}</td>
-                              <td>{r.coins_to_trade.toFixed(4)}</td>
+                              <td>{formatQty(r.coins_to_trade)}</td>
                               <td>{r.sell_origin || "—"}</td>
                               <td>
                                 <button
@@ -1352,7 +1469,7 @@ function App() {
                             </td>
                             <td>
                               <strong>
-                                {sym.total_buy_down_coins.toFixed(4)}
+                                {formatQty(sym.total_buy_down_coins)}
                               </strong>
                             </td>
                             <td></td>
@@ -1393,7 +1510,7 @@ function App() {
                                 {r.target_pct.toFixed(4)}%
                               </td>
                               <td>{formatPrice(r.target_price)}</td>
-                              <td>{r.coins_to_trade.toFixed(4)}</td>
+                              <td>{formatQty(r.coins_to_trade)}</td>
                             </tr>
                           ))}
                           <tr className="summary-total-row">
@@ -1402,7 +1519,7 @@ function App() {
                             </td>
                             <td>
                               <strong>
-                                {sym.total_sell_up_coins.toFixed(4)}
+                                {formatQty(sym.total_sell_up_coins)}
                               </strong>
                             </td>
                           </tr>

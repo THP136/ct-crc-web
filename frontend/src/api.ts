@@ -273,6 +273,17 @@ export async function saveSettings(
   return await res.json();
 }
 
+export async function ensureSettings(
+  symbol: string
+): Promise<{ ok?: boolean; error?: string; settings?: SettingsItem }> {
+  const res = await fetch(`${API}/task-engine/settings`, {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ symbol: symbol.trim().toUpperCase() }),
+  });
+  return await res.json();
+}
+
 // --------------- Summary ---------------
 
 export type SummaryRow = TaskQueueItem & {
@@ -309,6 +320,7 @@ export type Section = {
   symbol: string;
   x0: number;
   coin_qty: number;
+  quote_balance?: number;
   current_x: number;
   current_pct: number;
   seeded: boolean;
@@ -389,7 +401,7 @@ export async function createSection(
   symbol: string,
   name: string,
   x0: number,
-  coin_qty: number = 0
+  coin_qty: string
 ): Promise<CreateSectionResponse> {
   return runCommand<CreateSectionResponse>("create_section", {
     symbol: symbol.trim().toUpperCase(),
