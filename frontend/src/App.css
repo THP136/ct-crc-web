@@ -99,6 +99,27 @@ body {
   font-size: 1.1rem;
 }
 
+.nav-badge {
+  margin-left: auto;
+  padding: 1px 7px;
+  border-radius: 10px;
+  background: var(--red);
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+
+/* Review queue */
+.review-json,
+.review-error {
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
 /* Main content */
 .main-content {
   flex: 1;

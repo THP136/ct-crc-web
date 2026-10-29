@@ -15,8 +15,14 @@ import {
   fetchPriceHistory,
   fetchValidX0,
   fetchWorkerStatus,
+  fetchCommands,
+  fetchOrders,
+  retryCommand,
+  resyncOrder,
   deleteTask,
   deleteAllBuyTasks,
+  type CommandRecord,
+  type OrderRow,
   type WorkerStatus,
   type TaskQueueItem,
   type PassedTaskItem,
@@ -169,9 +175,76 @@ function InfoTip({ text }: { text: string }) {
   );
 }
 
+function ReviewCommandTable({
+  title,
+  emptyText,
+  commands,
+  onRetry,
+}: {
+  title: string;
+  emptyText: string;
+  commands: CommandRecord[];
+  onRetry: (command: CommandRecord) => void;
+}) {
+  return (
+    <section className="card">
+      <h2>
+        {title} ({commands.length})
+      </h2>
+      {commands.length === 0 ? (
+        <p className="sub">{emptyText}</p>
+      ) : (
+        <div className="scroll-table">
+          <table>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Type</th>
+                <th>Payload</th>
+                <th>Error</th>
+                <th>Attempts</th>
+                <th>Created</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {commands.map((cmd) => (
+                <tr key={cmd.id}>
+                  <td>{cmd.id}</td>
+                  <td>{cmd.command_type}</td>
+                  <td
+                    className="review-json"
+                    title={JSON.stringify(cmd.payload ?? {})}
+                  >
+                    {JSON.stringify(cmd.payload ?? {})}
+                  </td>
+                  <td className="review-error" title={cmd.error || ""}>
+                    {cmd.error || "—"}
+                  </td>
+                  <td>{cmd.attempts ?? 0}</td>
+                  <td>{cmd.created_at ?? "—"}</td>
+                  <td>
+                    <button
+                      type="button"
+                      className="btn-xs"
+                      onClick={() => onRetry(cmd)}
+                    >
+                      Retry
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function App() {
   const [page, setPage] = useState<
-    "engine" | "price" | "settings" | "summary"
+    "engine" | "price" | "settings" | "summary" | "review"
   >("engine");
   const [toast, setToast] = useState(false);
 
@@ -238,6 +311,14 @@ function App() {
   const [summaryData, setSummaryData] = useState<SummarySymbol[]>([]);
   const [summaryMessage, setSummaryMessage] = useState("");
 
+  // Review queue (failed commands / orders needing manual action)
+  const [reviewCommands, setReviewCommands] = useState<CommandRecord[]>([]);
+  const [failedCommands, setFailedCommands] = useState<CommandRecord[]>([]);
+  const [reviewOrders, setReviewOrders] = useState<OrderRow[]>([]);
+  const [reviewMessage, setReviewMessage] = useState("");
+  const [reviewLoading, setReviewLoading] = useState(false);
+  const [reviewCount, setReviewCount] = useState(0);
+
   // Worker heartbeat
   const [workerStatus, setWorkerStatus] = useState<{
     online: boolean;
@@ -284,6 +365,25 @@ function App() {
       setSectionPassedTasks(info.passed_tasks ?? []);
       setSectionClosedTasks(info.closed_tasks ?? []);
     });
+  };
+
+  const loadReview = async (showLoading = true) => {
+    if (showLoading) setReviewLoading(true);
+    try {
+      const [commands, failed, orders] = await Promise.all([
+        fetchCommands({ status: "NEEDS_REVIEW", limit: 200 }),
+        fetchCommands({ status: "FAILED", limit: 100 }),
+        fetchOrders({ review: true }),
+      ]);
+      setReviewCommands(commands);
+      setFailedCommands(failed);
+      setReviewOrders(orders);
+      setReviewCount(commands.length + orders.length);
+    } catch {
+      setReviewMessage("Không tải được danh sách review.");
+    } finally {
+      if (showLoading) setReviewLoading(false);
+    }
   };
 
 
@@ -353,6 +453,33 @@ function App() {
     if (page !== "summary") return;
     setSummaryMessage("");
     fetchSummary().then(setSummaryData);
+  }, [page]);
+
+  // Review page: poll commands + orders that need manual action.
+  useEffect(() => {
+    if (page !== "review") return;
+    setReviewMessage("");
+    loadReview();
+    const id = setInterval(() => loadReview(false), 10_000);
+    return () => clearInterval(id);
+  }, [page]);
+
+  // Keep the sidebar badge fresh while the user is on other pages.
+  useEffect(() => {
+    if (page === "review") return;
+    const poll = () => {
+      Promise.all([
+        fetchCommands({ status: "NEEDS_REVIEW", limit: 200 }),
+        fetchOrders({ review: true }),
+      ])
+        .then(([commands, orders]) => {
+          setReviewCount(commands.length + orders.length);
+        })
+        .catch(() => {});
+    };
+    poll();
+    const id = setInterval(poll, 30_000);
+    return () => clearInterval(id);
   }, [page]);
 
   // Debounced auto-fetch valid x0 when symbol input changes in Create Section form
@@ -544,6 +671,42 @@ function App() {
     setBroadcastPrice("");
   };
 
+  const handleRetryCommand = async (command: CommandRecord) => {
+    if (
+      !confirm(
+        `Đưa command #${command.id} (${command.command_type}) về PENDING để worker chạy lại?`
+      )
+    )
+      return;
+    setReviewMessage(`Đang requeue command #${command.id}…`);
+    const result = await retryCommand(command.id);
+    if (result.error) {
+      setReviewMessage(result.error);
+      return;
+    }
+    setReviewMessage(`Command #${command.id} đã về PENDING.`);
+    await loadReview();
+  };
+
+  const handleResyncOrder = async (order: OrderRow) => {
+    if (
+      !confirm(
+        `Fetch lại order task #${order.task_id} từ Binance?\n\nChỉ đồng bộ trạng thái; partial fill hoặc accounting lệch có thể vẫn NEEDS_REVIEW.`
+      )
+    )
+      return;
+    setReviewMessage(`Đang resync task #${order.task_id}…`);
+    const result = await resyncOrder(order.task_id);
+    if (result.error) {
+      setReviewMessage(result.error);
+      return;
+    }
+    setReviewMessage(
+      `Task #${order.task_id} đã về UNKNOWN; worker sẽ fetch lại ở chu kỳ tới.`
+    );
+    await loadReview();
+  };
+
   const handleGetPrice = async () => {
     const sym = priceSymbol.trim().toUpperCase();
     if (!sym) return;
@@ -568,6 +731,7 @@ function App() {
   const navItems = [
     { id: "engine" as const, label: "Task Engine", icon: "⚙" },
     { id: "summary" as const, label: "Summary", icon: "📊" },
+    { id: "review" as const, label: "Review", icon: "⚠" },
     { id: "settings" as const, label: "Settings", icon: "🔧" },
     { id: "price" as const, label: "Current price", icon: "📈" },
   ];
@@ -586,6 +750,9 @@ function App() {
             >
               <span className="sidebar-icon">{item.icon}</span>
               {item.label}
+              {item.id === "review" && reviewCount > 0 && (
+                <span className="nav-badge">{reviewCount}</span>
+              )}
             </button>
           ))}
         </nav>
@@ -1530,6 +1697,105 @@ function App() {
                 </section>
               ))
             )}
+          </>
+        )}
+
+        {page === "review" && (
+          <>
+            <p className="sub">
+              Command FAILED/NEEDS_REVIEW và order cần can thiệp. Retry command
+              đưa lệnh về PENDING. Re-check order chỉ fetch lại từ Binance;
+              partial fill hoặc accounting lệch vẫn cần xử lý tay.
+            </p>
+            <div className="summary-actions">
+              <button
+                type="button"
+                onClick={() => {
+                  setReviewMessage("");
+                  loadReview();
+                }}
+                disabled={reviewLoading}
+              >
+                {reviewLoading ? "Loading…" : "Refresh"}
+              </button>
+            </div>
+            {reviewMessage && (
+              <div className="engine-message">{reviewMessage}</div>
+            )}
+
+            <ReviewCommandTable
+              title="Commands cần review"
+              emptyText="(none)"
+              commands={reviewCommands}
+              onRetry={handleRetryCommand}
+            />
+
+            <ReviewCommandTable
+              title="Commands FAILED gần đây"
+              emptyText="(none)"
+              commands={failedCommands}
+              onRetry={handleRetryCommand}
+            />
+
+            <section className="card">
+              <h2>Orders cần review ({reviewOrders.length})</h2>
+              {reviewOrders.length === 0 ? (
+                <p className="sub">(none)</p>
+              ) : (
+                <div className="scroll-table">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Task</th>
+                        <th>Section</th>
+                        <th>Symbol</th>
+                        <th>Side</th>
+                        <th>Status</th>
+                        <th>Accounting</th>
+                        <th>Filled / Amount</th>
+                        <th>Error</th>
+                        <th>Updated</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {reviewOrders.map((order) => (
+                        <tr key={order.task_id}>
+                          <td>{order.task_id}</td>
+                          <td>{order.section_id}</td>
+                          <td>{order.symbol}</td>
+                          <td>
+                            {order.side} {order.direction}
+                          </td>
+                          <td>{order.status}</td>
+                          <td>{order.accounting_status || "—"}</td>
+                          <td>
+                            {formatQty(order.filled_amount)} /{" "}
+                            {formatQty(order.amount)}
+                          </td>
+                          <td
+                            className="review-error"
+                            title={order.last_error || ""}
+                          >
+                            {order.last_error || "—"}
+                          </td>
+                          <td>{order.updated_at ?? "—"}</td>
+                          <td>
+                            <button
+                              type="button"
+                              className="btn-xs"
+                              onClick={() => handleResyncOrder(order)}
+                            >
+                              Re-check
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </section>
           </>
         )}
 

@@ -113,9 +113,13 @@ export type CommandRecord = {
   id: number;
   command_type: string;
   status: CommandStatus;
+  payload?: Record<string, unknown>;
   result?: unknown;
   error?: string;
   attempts?: number;
+  locked_by?: string | null;
+  created_at?: string | null;
+  processed_at?: string | null;
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -149,7 +153,9 @@ async function waitForCommand(
 ): Promise<CommandRecord> {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    const res = await fetch(`${API}/task-engine/commands/${commandId}`);
+    const res = await fetch(`${API}/task-engine/commands/${commandId}`, {
+      headers: authHeaders(),
+    });
     if (!res.ok) {
       return {
         id: commandId,
@@ -187,6 +193,35 @@ async function runCommand<T extends { error?: string }>(
     return { ...result, error: failure };
   }
   return (record.result ?? { ok: true }) as T;
+}
+
+export async function fetchCommands(params?: {
+  status?: CommandStatus;
+  limit?: number;
+}): Promise<CommandRecord[]> {
+  const query = new URLSearchParams();
+  if (params?.status) query.set("status", params.status);
+  if (params?.limit) query.set("limit", String(params.limit));
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  const res = await fetch(`${API}/task-engine/commands${suffix}`, {
+    headers: authHeaders(),
+  });
+  const data = await res.json();
+  return data.commands ?? [];
+}
+
+export async function retryCommand(
+  commandId: number
+): Promise<{ ok?: boolean; error?: string }> {
+  const res = await fetch(`${API}/task-engine/commands/${commandId}/retry`, {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    return { error: data.error ?? "Failed to retry command" };
+  }
+  return data;
 }
 
 export async function fetchTaskEngineSymbols(): Promise<string[]> {
@@ -483,8 +518,11 @@ export type OrderRow = {
   status: string;
   filled_amount: number;
   avg_fill_price?: number | null;
+  accounting_status?: string;
   attempts: number;
   last_error?: string;
+  completed_at?: string | null;
+  last_synced_at?: string | null;
   created_at?: string;
   updated_at?: string;
 };
@@ -502,17 +540,33 @@ export async function fetchOrders(params?: {
   symbol?: string;
   section_id?: number;
   status?: string;
+  review?: boolean;
 }): Promise<OrderRow[]> {
   const query = new URLSearchParams();
   if (params?.symbol) query.set("symbol", params.symbol);
   if (params?.section_id) query.set("section_id", String(params.section_id));
   if (params?.status) query.set("status", params.status);
+  if (params?.review) query.set("review", "1");
   const suffix = query.toString() ? `?${query.toString()}` : "";
   const res = await fetch(`${API}/task-engine/orders${suffix}`, {
     headers: authHeaders(),
   });
   const data = await res.json();
   return data.orders ?? [];
+}
+
+export async function resyncOrder(
+  taskId: number
+): Promise<{ ok?: boolean; error?: string }> {
+  const res = await fetch(`${API}/task-engine/orders/${taskId}/resync`, {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    return { error: data.error ?? "Failed to resync order" };
+  }
+  return data;
 }
 
 export async function fetchWorkerStatus(): Promise<{
